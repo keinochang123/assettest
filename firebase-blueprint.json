@@ -1,0 +1,73 @@
+{
+  "entities": {
+    "InventoryPlan": {
+      "title": "Inventory Plan",
+      "description": "A specific inventory plan like '115年中盤點'",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "Name of the plan" },
+        "description": { "type": "string", "description": "Description of the plan" },
+        "scope": { "type": "string", "description": "Scope of the plan (e.g., All, Office A, Category B)" },
+        "status": { "type": "string", "enum": ["active", "completed"], "description": "Current status of the plan" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "When the plan was created" }
+      },
+      "required": ["name", "status", "createdAt"]
+    },
+    "Asset": {
+      "title": "Asset",
+      "description": "An asset to be inventoried within a plan",
+      "type": "object",
+      "properties": {
+        "planId": { "type": "string", "description": "Reference to the InventoryPlan ID" },
+        "assetCode": { "type": "string", "description": "Concatenated AssetCode-SubNumber" },
+        "companyCode": { "type": "string", "description": "Company code" },
+        "accountName": { "type": "string", "description": "Account name" },
+        "categoryName": { "type": "string", "description": "Category name" },
+        "assetDescription": { "type": "string", "description": "Asset description" },
+        "acquisitionDate": { "type": "string", "description": "Acquisition date" },
+        "acquisitionCost": { "type": "number", "description": "Acquisition cost" },
+        "bookValue": { "type": "number", "description": "Book value" },
+        "quantity": { "type": "number", "description": "Quantity" },
+        "unit": { "type": "string", "description": "Unit" },
+        "costCenter": { "type": "string", "description": "Cost center" },
+        "originalCustodian": { "type": "string", "description": "Original custodian from SAP" },
+        "originalLocation": { "type": "string", "description": "Original location from SAP" },
+        "originalOffice": { "type": "string", "description": "Original office (室) from SAP" },
+        "status": { "type": "string", "enum": ["pending", "checked"], "description": "Inventory status" },
+        "checkResult": { "type": "string", "enum": ["normal", "abnormal"], "description": "Result of the check" },
+        "checkRemark": { "type": "string", "description": "Remarks from the check" },
+        "checkTime": { "type": "string", "format": "date-time", "description": "When it was checked" },
+        "checkBy": { "type": "string", "description": "User ID who checked it" },
+        "updatedCustodian": { "type": "string", "description": "Updated custodian if changed" },
+        "updatedLocation": { "type": "string", "description": "Updated location if changed" },
+        "updatedOffice": { "type": "string", "description": "Updated office if changed" }
+      },
+      "required": ["planId", "assetCode", "status"]
+    },
+    "User": {
+      "title": "User",
+      "description": "System user with roles",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "format": "email" },
+        "role": { "type": "string", "enum": ["admin", "pda_user"] },
+        "name": { "type": "string" }
+      },
+      "required": ["email", "role"]
+    }
+  },
+  "firestore": {
+    "/plans/{planId}": {
+      "schema": "InventoryPlan",
+      "description": "Collection of inventory plans"
+    },
+    "/assets/{assetId}": {
+      "schema": "Asset",
+      "description": "Collection of assets across all plans"
+    },
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "System users"
+    }
+  }
+}

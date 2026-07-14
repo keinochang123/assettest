@@ -1,0 +1,7 @@
+{
+  "name": "資產盤點管理系統",
+  "description": "提供盤點計畫管理、PDA 行動掃描盤點、即時進度監控與差異報表匯出的全方位資產盤點解決方案。",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
