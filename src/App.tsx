@@ -144,10 +144,31 @@ const formatExcelDate = (val: any): string => {
   return strVal;
 };
 
+const formatCreatedAt = (createdAt: any): string => {
+  if (!createdAt) return '';
+  if (typeof createdAt.toDate === 'function') {
+    return createdAt.toDate().toLocaleDateString();
+  }
+  if (createdAt.seconds) {
+    return new Date(createdAt.seconds * 1000).toLocaleDateString();
+  }
+  if (typeof createdAt === 'string' || typeof createdAt === 'number') {
+    return new Date(createdAt).toLocaleDateString();
+  }
+  return '';
+};
+
 // --- Main App ---
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'plans' | 'pda' | 'reports'>('plans');
+  const [isLocalMode, setIsLocalMode] = useState<boolean>(() => {
+    return localStorage.getItem('is_local_mode') === 'true';
+  });
+
+  useEffect(() => {
+    localStorage.setItem('is_local_mode', String(isLocalMode));
+  }, [isLocalMode]);
   
   // Plans State
   const [plans, setPlans] = useState<InventoryPlan[]>([]);
@@ -181,6 +202,16 @@ export default function App() {
 
   // Plans Listener
   useEffect(() => {
+    if (isLocalMode) {
+      const localPlansStr = localStorage.getItem('local_plans');
+      const localPlans = localPlansStr ? JSON.parse(localPlansStr) : [];
+      setPlans(localPlans);
+      if (localPlans.length > 0 && !selectedPlanId) {
+        setSelectedPlanId(localPlans[0].id);
+      }
+      return;
+    }
+
     const q = query(collection(db, 'plans'), orderBy('createdAt', 'desc'));
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const plansData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as InventoryPlan));
@@ -188,9 +219,13 @@ export default function App() {
       if (plansData.length > 0 && !selectedPlanId) {
         setSelectedPlanId(plansData[0].id!);
       }
+    }, (error: any) => {
+      console.error("Firestore plans listener failed, auto-switching to local mode:", error);
+      setIsLocalMode(true);
+      showToast('已切換至「本機模擬儲存模式」（雲端額度已滿或無權限）', 'info');
     });
     return unsubscribe;
-  }, []);
+  }, [isLocalMode]);
 
   // Assets Listener
   useEffect(() => {
@@ -198,12 +233,25 @@ export default function App() {
       setAssets([]);
       return;
     }
+
+    if (isLocalMode) {
+      const localAssetsStr = localStorage.getItem('local_assets');
+      const allLocalAssets: Asset[] = localAssetsStr ? JSON.parse(localAssetsStr) : [];
+      const filteredAssets = allLocalAssets.filter(a => a.planId === selectedPlanId);
+      setAssets(filteredAssets);
+      return;
+    }
+
     const q = query(collection(db, 'assets'), where('planId', '==', selectedPlanId));
     const unsubscribe = onSnapshot(q, (snapshot) => {
       setAssets(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Asset)));
+    }, (error: any) => {
+      console.error("Firestore assets listener failed, auto-switching to local mode:", error);
+      setIsLocalMode(true);
+      showToast('已切換至「本機模擬儲存模式」（雲端額度已滿或無權限）', 'info');
     });
     return unsubscribe;
-  }, [selectedPlanId]);
+  }, [selectedPlanId, isLocalMode]);
 
   // PDA Scanner Effect
   useEffect(() => {
@@ -335,6 +383,40 @@ export default function App() {
   const handleSubmitBatch = async () => {
     if (batchAssets.length === 0) return;
     try {
+      if (isLocalMode) {
+        const localAssetsStr = localStorage.getItem('local_assets');
+        const allLocalAssets: Asset[] = localAssetsStr ? JSON.parse(localAssetsStr) : [];
+        
+        batchAssets.forEach(batchAsset => {
+          const idx = allLocalAssets.findIndex(a => a.id === batchAsset.id);
+          if (idx >= 0) {
+            allLocalAssets[idx] = {
+              ...allLocalAssets[idx],
+              status: 'checked',
+              checkResult: batchAsset.checkResult || 'normal',
+              checkRemark: batchAsset.checkRemark || '',
+              checkTime: Timestamp.now(),
+              checkBy: 'system',
+              updatedCustodian: batchAsset.updatedCustodian || '',
+              updatedLocation: batchAsset.updatedLocation || '',
+              updatedOffice: batchAsset.updatedOffice || ''
+            };
+          }
+        });
+        
+        localStorage.setItem('local_assets', JSON.stringify(allLocalAssets));
+        
+        // Refresh local assets list for current selectedPlanId
+        const filtered = allLocalAssets.filter(a => a.planId === selectedPlanId);
+        setAssets(filtered);
+        
+        showToast('整批盤點結果已提交成功！(儲存至本機)', 'success');
+        setBatchAssets([]);
+        setEditingIndex(null);
+        return;
+      }
+
+      // Firebase Mode
       const BATCH_SIZE = 450;
       const batches = [];
       let currentBatch = writeBatch(db);
@@ -365,9 +447,14 @@ export default function App() {
       showToast('整批盤點結果已提交成功！', 'success');
       setBatchAssets([]);
       setEditingIndex(null);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to submit batch check', error);
-      showToast('提交失敗，請檢查網路連線', 'error');
+      if (error?.code === 'resource-exhausted' || error?.message?.includes('permission-denied') || error?.message?.includes('permission')) {
+        setIsLocalMode(true);
+        showToast('雲端流量已達上限！已為您自動切換至「本機模擬儲存模式」。請再次點擊提交。', 'error');
+      } else {
+        showToast('提交失敗，請檢查網路連線', 'error');
+      }
     }
   };
 
@@ -380,6 +467,36 @@ export default function App() {
     
     setIsCreatingPlan(true);
     try {
+      if (isLocalMode) {
+        const newPlanId = 'plan_' + Date.now();
+        const planObj: InventoryPlan = {
+          id: newPlanId,
+          name: newPlan.name,
+          description: newPlan.description,
+          scope: newPlan.scope,
+          status: 'active',
+          createdAt: Timestamp.now()
+        };
+
+        const localPlansStr = localStorage.getItem('local_plans');
+        const localPlans: InventoryPlan[] = localPlansStr ? JSON.parse(localPlansStr) : [];
+        localPlans.unshift(planObj);
+        localStorage.setItem('local_plans', JSON.stringify(localPlans));
+        setPlans(localPlans);
+
+        if (importFile) {
+          await handleImportExcel(importFile, newPlanId);
+        }
+
+        setShowNewPlanModal(false);
+        setNewPlan({ name: '', description: '', scope: '' });
+        setImportFile(null);
+        setSelectedPlanId(newPlanId);
+        showToast('本機計畫建立成功！', 'success');
+        return;
+      }
+
+      // Firebase Mode
       const planRef = await addDoc(collection(db, 'plans'), {
         ...newPlan,
         status: 'active',
@@ -394,9 +511,15 @@ export default function App() {
       setNewPlan({ name: '', description: '', scope: '' });
       setImportFile(null);
       setSelectedPlanId(planRef.id);
-    } catch (error) {
+      showToast('計畫建立成功！', 'success');
+    } catch (error: any) {
       console.error('Failed to create plan', error);
-      showToast('建立計畫失敗，請檢查網路連線', 'error');
+      if (error?.code === 'resource-exhausted' || error?.message?.includes('permission-denied') || error?.message?.includes('permission')) {
+        setIsLocalMode(true);
+        showToast('雲端流量已達上限！已自動切換至「本機儲存模式」，請重新點擊建立計畫。', 'error');
+      } else {
+        showToast('建立計畫失敗，請檢查網路連線', 'error');
+      }
     } finally {
       setIsCreatingPlan(false);
     }
@@ -413,6 +536,52 @@ export default function App() {
           const ws = wb.Sheets[wsname];
           const data = XLSX.utils.sheet_to_json(ws) as any[];
 
+          const getVal = (row: any, target: string) => {
+            const normalizedTarget = target.replace(/\s+/g, '');
+            const key = Object.keys(row).find(k => k.replace(/\s+/g, '') === normalizedTarget);
+            return key ? row[key] : undefined;
+          };
+
+          if (isLocalMode) {
+            const localAssets: Asset[] = [];
+            data.forEach((row) => {
+              const assetNum = String(getVal(row, '資產編號') || '');
+              const subNum = String(getVal(row, '子編號') || '');
+              const fullAssetCode = assetNum && subNum ? `${assetNum}-${subNum}` : (assetNum || subNum);
+
+              localAssets.push({
+                id: 'asset_' + Math.random().toString(36).substring(2, 11) + '_' + Date.now(),
+                planId: planId,
+                assetCode: fullAssetCode,
+                companyCode: String(getVal(row, '公司代碼') || ''),
+                accountName: String(getVal(row, '科目名稱') || ''),
+                categoryName: String(getVal(row, '類別名稱') || ''),
+                assetDescription: String(getVal(row, '資產說明') || ''),
+                acquisitionDate: formatExcelDate(getVal(row, '取得日期')),
+                acquisitionCost: Number(getVal(row, '取得成本') || 0),
+                bookValue: Number(getVal(row, '帳面價值') || 0),
+                quantity: Number(getVal(row, '數量') || 0),
+                unit: String(getVal(row, '單位') || ''),
+                originalOffice: String(getVal(row, '室') || ''),
+                originalCustodian: String(getVal(row, '保管人') || ''),
+                originalLocation: String(getVal(row, '地點') || ''),
+                costCenter: String(getVal(row, '成本中心') || ''),
+                status: 'pending'
+              });
+            });
+
+            const localAssetsStr = localStorage.getItem('local_assets');
+            const allLocalAssets: Asset[] = localAssetsStr ? JSON.parse(localAssetsStr) : [];
+            const merged = [...allLocalAssets, ...localAssets];
+            localStorage.setItem('local_assets', JSON.stringify(merged));
+
+            // Refresh state
+            const filtered = merged.filter(a => a.planId === planId);
+            setAssets(filtered);
+            resolve();
+            return;
+          }
+
           // Firestore limits batches to 500 operations. We use 450 to be safe.
           const BATCH_SIZE = 450;
           const batches = [];
@@ -422,33 +591,26 @@ export default function App() {
           data.forEach((row, index) => {
             const assetRef = doc(collection(db, 'assets'));
             
-            // Helper to find value by ignoring whitespace in keys
-            const getVal = (target: string) => {
-              const normalizedTarget = target.replace(/\s+/g, '');
-              const key = Object.keys(row).find(k => k.replace(/\s+/g, '') === normalizedTarget);
-              return key ? row[key] : undefined;
-            };
-
-            const assetNum = String(getVal('資產編號') || '');
-            const subNum = String(getVal('子編號') || '');
+            const assetNum = String(getVal(row, '資產編號') || '');
+            const subNum = String(getVal(row, '子編號') || '');
             const fullAssetCode = assetNum && subNum ? `${assetNum}-${subNum}` : (assetNum || subNum);
 
             currentBatch.set(assetRef, {
               planId: planId,
               assetCode: fullAssetCode,
-              companyCode: String(getVal('公司代碼') || ''),
-              accountName: String(getVal('科目名稱') || ''),
-              categoryName: String(getVal('類別名稱') || ''),
-              assetDescription: String(getVal('資產說明') || ''),
-              acquisitionDate: formatExcelDate(getVal('取得日期')),
-              acquisitionCost: Number(getVal('取得成本') || 0),
-              bookValue: Number(getVal('帳面價值') || 0),
-              quantity: Number(getVal('數量') || 0),
-              unit: String(getVal('單位') || ''),
-              originalOffice: String(getVal('室') || ''),
-              originalCustodian: String(getVal('保管人') || ''),
-              originalLocation: String(getVal('地點') || ''),
-              costCenter: String(getVal('成本中心') || ''),
+              companyCode: String(getVal(row, '公司代碼') || ''),
+              accountName: String(getVal(row, '科目名稱') || ''),
+              categoryName: String(getVal(row, '類別名稱') || ''),
+              assetDescription: String(getVal(row, '資產說明') || ''),
+              acquisitionDate: formatExcelDate(getVal(row, '取得日期')),
+              acquisitionCost: Number(getVal(row, '取得成本') || 0),
+              bookValue: Number(getVal(row, '帳面價值') || 0),
+              quantity: Number(getVal(row, '數量') || 0),
+              unit: String(getVal(row, '單位') || ''),
+              originalOffice: String(getVal(row, '室') || ''),
+              originalCustodian: String(getVal(row, '保管人') || ''),
+              originalLocation: String(getVal(row, '地點') || ''),
+              costCenter: String(getVal(row, '成本中心') || ''),
               status: 'pending'
             });
 
@@ -463,7 +625,7 @@ export default function App() {
 
           await Promise.all(batches);
           resolve();
-        } catch (error) {
+        } catch (error: any) {
           console.error('Import failed', error);
           reject(error);
         }
@@ -475,6 +637,21 @@ export default function App() {
 
   const handleClearAllData = async () => {
     try {
+      if (isLocalMode) {
+        localStorage.setItem('local_plans', JSON.stringify([]));
+        localStorage.setItem('local_assets', JSON.stringify([]));
+        setPlans([]);
+        setAssets([]);
+        setSelectedPlanId(null);
+        setShowClearConfirm(false);
+        showToast('所有本機資料已清除成功！', 'success');
+        return;
+      }
+
+      // Also clean up local caches in case
+      localStorage.setItem('local_plans', JSON.stringify([]));
+      localStorage.setItem('local_assets', JSON.stringify([]));
+
       const BATCH_SIZE = 450;
       
       const assetsSnap = await getDocs(collection(db, 'assets'));
@@ -516,9 +693,20 @@ export default function App() {
       showToast('所有資料已清除成功！', 'success');
       setSelectedPlanId(null);
       setShowClearConfirm(false);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to clear data', error);
-      showToast('清除失敗', 'error');
+      if (error?.code === 'resource-exhausted' || error?.message?.includes('permission-denied') || error?.message?.includes('permission')) {
+        setIsLocalMode(true);
+        localStorage.setItem('local_plans', JSON.stringify([]));
+        localStorage.setItem('local_assets', JSON.stringify([]));
+        setPlans([]);
+        setAssets([]);
+        setSelectedPlanId(null);
+        setShowClearConfirm(false);
+        showToast('雲端限額已滿，已為您清除本機快取並切換至「本機模擬儲存模式」', 'success');
+      } else {
+        showToast('清除失敗，請檢查網路連線', 'error');
+      }
     }
   };
 
@@ -725,6 +913,34 @@ export default function App() {
             )}
           </div>
           <div className="flex items-center gap-3">
+            {/* Mode Switcher */}
+            <div className="flex items-center bg-slate-100 rounded-lg p-1 text-xs font-semibold select-none gap-1 border border-slate-200">
+              <button
+                onClick={() => {
+                  setIsLocalMode(false);
+                  showToast('已嘗試切換回雲端同步模式', 'info');
+                }}
+                className={cn(
+                  "px-2 py-1 rounded-md transition-all font-bold",
+                  !isLocalMode ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-800"
+                )}
+              >
+                雲端同步
+              </button>
+              <button
+                onClick={() => {
+                  setIsLocalMode(true);
+                  showToast('已切換至本機模擬儲存模式', 'info');
+                }}
+                className={cn(
+                  "px-2 py-1 rounded-md transition-all font-bold",
+                  isLocalMode ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-800"
+                )}
+              >
+                本機模擬
+              </button>
+            </div>
+
             <select 
               className="bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-blue-500/20"
               value={selectedPlanId || ''}
@@ -745,6 +961,24 @@ export default function App() {
         </header>
 
         <div className="flex-1 overflow-y-auto p-6">
+          {isLocalMode && (
+            <div className="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-xl text-amber-800 flex flex-col sm:flex-row items-start sm:items-center gap-3 shadow-sm max-w-6xl mx-auto">
+              <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5 sm:mt-0" />
+              <div className="flex-1 text-sm font-medium">
+                <span className="font-bold">⚠️ 目前已啟用「瀏覽器本機儲存模式」</span>：偵測到 Firebase 雲端資料庫額度已達上限（或未設定權限），系統已自動為您切換。所有計畫建立、Excel 匯入、盤點與報表功能皆可在此瀏覽器中正常運作！
+              </div>
+              <button 
+                onClick={() => {
+                  setIsLocalMode(false);
+                  showToast('已嘗試切換回雲端同步模式', 'info');
+                }}
+                className="text-xs bg-amber-600 hover:bg-amber-700 text-white px-3 py-1.5 rounded-lg transition-colors font-bold self-end sm:self-auto shrink-0"
+              >
+                嘗試切換回雲端模式
+              </button>
+            </div>
+          )}
+
           <AnimatePresence mode="wait">
             {/* Tab: Plans */}
             {activeTab === 'plans' && (
@@ -785,7 +1019,7 @@ export default function App() {
                           </div>
                           <div className="flex items-center gap-1">
                             <History className="w-3 h-3" />
-                            {plan.createdAt.toDate().toLocaleDateString()}
+                            {formatCreatedAt(plan.createdAt)}
                           </div>
                         </div>
                       </div>
