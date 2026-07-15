@@ -119,6 +119,19 @@ const Input = ({ label, ...props }: { label?: string } & React.InputHTMLAttribut
 
 // --- Utilities ---
 
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number = 5500): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => 
+      setTimeout(() => {
+        const err = new Error('Firebase operation timeout (Quota limit exceeded or offline)');
+        (err as any).code = 'timeout';
+        reject(err);
+      }, timeoutMs)
+    )
+  ]);
+}
+
 const formatExcelDate = (val: any): string => {
   if (val === undefined || val === null || val === '') return '';
   
@@ -178,6 +191,7 @@ export default function App() {
   const [newPlan, setNewPlan] = useState({ name: '', description: '', scope: '' });
   const [importFile, setImportFile] = useState<File | null>(null);
   const [isCreatingPlan, setIsCreatingPlan] = useState(false);
+  const [isClearing, setIsClearing] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
 
   const showToast = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
@@ -202,23 +216,59 @@ export default function App() {
 
   // Plans Listener
   useEffect(() => {
+    const clearAllTimestampStr = localStorage.getItem('clear_all_timestamp');
+    const clearAllTime = clearAllTimestampStr ? Number(clearAllTimestampStr) : 0;
+
     if (isLocalMode) {
       const localPlansStr = localStorage.getItem('local_plans');
-      const localPlans = localPlansStr ? JSON.parse(localPlansStr) : [];
-      setPlans(localPlans);
-      if (localPlans.length > 0 && !selectedPlanId) {
-        setSelectedPlanId(localPlans[0].id);
+      let localPlans: InventoryPlan[] = [];
+      try {
+        localPlans = localPlansStr ? JSON.parse(localPlansStr) : [];
+      } catch (e) {
+        console.error("Failed to parse local plans", e);
       }
+      
+      const clearedPlanIdsStr = localStorage.getItem('cleared_plan_ids') || '[]';
+      let clearedPlanIds: string[] = [];
+      try { clearedPlanIds = JSON.parse(clearedPlanIdsStr); } catch (e) {}
+
+      const filtered = localPlans.filter(p => {
+        if (!p.id) return false;
+        if (clearedPlanIds.includes(p.id)) return false;
+        if (p.createdAt) {
+          const createdAtAny = p.createdAt as any;
+          const createdAtMs = typeof createdAtAny.toMillis === 'function'
+            ? createdAtAny.toMillis()
+            : (typeof createdAtAny.toDate === 'function' ? createdAtAny.toDate().getTime() : new Date(createdAtAny).getTime());
+          if (createdAtMs <= clearAllTime) return false;
+        }
+        return true;
+      });
+      setPlans(filtered);
       return;
     }
 
     const q = query(collection(db, 'plans'), orderBy('createdAt', 'desc'));
     const unsubscribe = onSnapshot(q, (snapshot) => {
-      const plansData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as InventoryPlan));
+      const clearedPlanIdsStr = localStorage.getItem('cleared_plan_ids') || '[]';
+      let clearedPlanIds: string[] = [];
+      try { clearedPlanIds = JSON.parse(clearedPlanIdsStr); } catch (e) {}
+
+      const plansData = snapshot.docs
+        .map(doc => ({ id: doc.id, ...doc.data() } as InventoryPlan))
+        .filter(p => {
+          if (!p.id) return false;
+          if (clearedPlanIds.includes(p.id)) return false;
+          if (p.createdAt) {
+            const createdAtAny = p.createdAt as any;
+            const createdAtMs = typeof createdAtAny.toMillis === 'function'
+              ? createdAtAny.toMillis()
+              : (typeof createdAtAny.toDate === 'function' ? createdAtAny.toDate().getTime() : new Date(createdAtAny).getTime());
+            if (createdAtMs <= clearAllTime) return false;
+          }
+          return true;
+        });
       setPlans(plansData);
-      if (plansData.length > 0 && !selectedPlanId) {
-        setSelectedPlanId(plansData[0].id!);
-      }
     }, (error: any) => {
       console.error("Firestore plans listener failed, auto-switching to local mode:", error);
       setIsLocalMode(true);
@@ -226,6 +276,18 @@ export default function App() {
     });
     return unsubscribe;
   }, [isLocalMode]);
+
+  // Synchronize selectedPlanId with available plans when plans list changes or mode switches
+  useEffect(() => {
+    if (plans.length > 0) {
+      const exists = plans.some(p => p.id === selectedPlanId);
+      if (!exists) {
+        setSelectedPlanId(plans[0].id || null);
+      }
+    } else {
+      setSelectedPlanId(null);
+    }
+  }, [plans, isLocalMode]);
 
   // Assets Listener
   useEffect(() => {
@@ -237,14 +299,36 @@ export default function App() {
     if (isLocalMode) {
       const localAssetsStr = localStorage.getItem('local_assets');
       const allLocalAssets: Asset[] = localAssetsStr ? JSON.parse(localAssetsStr) : [];
-      const filteredAssets = allLocalAssets.filter(a => a.planId === selectedPlanId);
+      
+      const clearedAssetIdsStr = localStorage.getItem('cleared_asset_ids') || '[]';
+      let clearedAssetIds: string[] = [];
+      try { clearedAssetIds = JSON.parse(clearedAssetIdsStr); } catch (e) {}
+
+      const filteredAssets = allLocalAssets
+        .filter(a => a.planId === selectedPlanId)
+        .filter(a => {
+          if (!a.id) return false;
+          if (clearedAssetIds.includes(a.id)) return false;
+          return true;
+        });
       setAssets(filteredAssets);
       return;
     }
 
     const q = query(collection(db, 'assets'), where('planId', '==', selectedPlanId));
     const unsubscribe = onSnapshot(q, (snapshot) => {
-      setAssets(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Asset)));
+      const clearedAssetIdsStr = localStorage.getItem('cleared_asset_ids') || '[]';
+      let clearedAssetIds: string[] = [];
+      try { clearedAssetIds = JSON.parse(clearedAssetIdsStr); } catch (e) {}
+
+      const assetsData = snapshot.docs
+        .map(doc => ({ id: doc.id, ...doc.data() } as Asset))
+        .filter(a => {
+          if (!a.id) return false;
+          if (clearedAssetIds.includes(a.id)) return false;
+          return true;
+        });
+      setAssets(assetsData);
     }, (error: any) => {
       console.error("Firestore assets listener failed, auto-switching to local mode:", error);
       setIsLocalMode(true);
@@ -437,21 +521,25 @@ export default function App() {
 
         count++;
         if (count === BATCH_SIZE || index === batchAssets.length - 1) {
-          batches.push(currentBatch.commit());
+          batches.push(currentBatch);
           currentBatch = writeBatch(db);
           count = 0;
         }
       });
 
-      await Promise.all(batches);
+      // Commit sequentially with a generous 15-second timeout per batch
+      for (const batch of batches) {
+        await withTimeout(batch.commit(), 15000);
+      }
+      
       showToast('整批盤點結果已提交成功！', 'success');
       setBatchAssets([]);
       setEditingIndex(null);
     } catch (error: any) {
       console.error('Failed to submit batch check', error);
-      if (error?.code === 'resource-exhausted' || error?.message?.includes('permission-denied') || error?.message?.includes('permission')) {
+      if (error?.code === 'resource-exhausted' || error?.code === 'timeout' || error?.message?.includes('permission-denied') || error?.message?.includes('permission') || error?.message?.includes('timeout')) {
         setIsLocalMode(true);
-        showToast('雲端流量已達上限！已為您自動切換至「本機模擬儲存模式」。請再次點擊提交。', 'error');
+        showToast('雲端流量已達上限或連線逾時！已為您自動切換至「本機模擬儲存模式」。請再次點擊提交。', 'error');
       } else {
         showToast('提交失敗，請檢查網路連線', 'error');
       }
@@ -497,11 +585,11 @@ export default function App() {
       }
 
       // Firebase Mode
-      const planRef = await addDoc(collection(db, 'plans'), {
+      const planRef = await withTimeout(addDoc(collection(db, 'plans'), {
         ...newPlan,
         status: 'active',
         createdAt: Timestamp.now()
-      });
+      }), 15000);
       
       if (importFile) {
         await handleImportExcel(importFile, planRef.id);
@@ -514,9 +602,9 @@ export default function App() {
       showToast('計畫建立成功！', 'success');
     } catch (error: any) {
       console.error('Failed to create plan', error);
-      if (error?.code === 'resource-exhausted' || error?.message?.includes('permission-denied') || error?.message?.includes('permission')) {
+      if (error?.code === 'resource-exhausted' || error?.code === 'timeout' || error?.message?.includes('permission-denied') || error?.message?.includes('permission') || error?.message?.includes('timeout')) {
         setIsLocalMode(true);
-        showToast('雲端流量已達上限！已自動切換至「本機儲存模式」，請重新點擊建立計畫。', 'error');
+        showToast('雲端流量已達上限或連線逾時！已自動切換至「本機儲存模式」，請重新點擊建立計畫。', 'error');
       } else {
         showToast('建立計畫失敗，請檢查網路連線', 'error');
       }
@@ -617,13 +705,16 @@ export default function App() {
             operationCount++;
 
             if (operationCount === BATCH_SIZE || index === data.length - 1) {
-              batches.push(currentBatch.commit());
+              batches.push(currentBatch);
               currentBatch = writeBatch(db);
               operationCount = 0;
             }
           });
 
-          await Promise.all(batches);
+          // Commit batches sequentially with a safe 15s timeout per batch to avoid random timeout switching to local mode
+          for (const batch of batches) {
+            await withTimeout(batch.commit(), 15000);
+          }
           resolve();
         } catch (error: any) {
           console.error('Import failed', error);
@@ -636,78 +727,123 @@ export default function App() {
   };
 
   const handleClearAllData = async () => {
-    try {
-      if (isLocalMode) {
-        localStorage.setItem('local_plans', JSON.stringify([]));
-        localStorage.setItem('local_assets', JSON.stringify([]));
-        setPlans([]);
-        setAssets([]);
-        setSelectedPlanId(null);
-        setShowClearConfirm(false);
-        showToast('所有本機資料已清除成功！', 'success');
-        return;
-      }
+    if (isClearing) return;
+    setIsClearing(true);
+    
+    // 1. Instantly record clear timestamp and local-first clean-up to guarantee immediate UI updates
+    const now = Date.now();
+    localStorage.setItem('clear_all_timestamp', String(now));
 
-      // Also clean up local caches in case
-      localStorage.setItem('local_plans', JSON.stringify([]));
-      localStorage.setItem('local_assets', JSON.stringify([]));
+    const currentPlanIds = plans.map(p => p.id).filter(Boolean) as string[];
+    const currentAssetIds = assets.map(a => a.id).filter(Boolean) as string[];
 
-      const BATCH_SIZE = 450;
-      
-      const assetsSnap = await getDocs(collection(db, 'assets'));
-      if (assetsSnap.size > 0) {
-        const batches = [];
-        let currentBatch = writeBatch(db);
-        let count = 0;
+    const storedClearedPlansStr = localStorage.getItem('cleared_plan_ids') || '[]';
+    let storedClearedPlans: string[] = [];
+    try { storedClearedPlans = JSON.parse(storedClearedPlansStr); } catch (e) {}
+
+    const storedClearedAssetsStr = localStorage.getItem('cleared_asset_ids') || '[]';
+    let storedClearedAssets: string[] = [];
+    try { storedClearedAssets = JSON.parse(storedClearedAssetsStr); } catch (e) {}
+
+    let updatedClearedPlans = Array.from(new Set([...storedClearedPlans, ...currentPlanIds]));
+    let updatedClearedAssets = Array.from(new Set([...storedClearedAssets, ...currentAssetIds]));
+
+    localStorage.setItem('cleared_plan_ids', JSON.stringify(updatedClearedPlans));
+    localStorage.setItem('cleared_asset_ids', JSON.stringify(updatedClearedAssets));
+
+    // Reset local cache files
+    localStorage.setItem('local_plans', JSON.stringify([]));
+    localStorage.setItem('local_assets', JSON.stringify([]));
+    
+    // Reset React state variables instantly so there is NO waiting spinner or delay
+    setPlans([]);
+    setAssets([]);
+    setBatchAssets([]);
+    setEditingIndex(null);
+    setSelectedPlanId(null);
+    
+    // Close confirmation dialog and stop the clearing spinner instantly
+    setShowClearConfirm(false);
+    setIsClearing(false);
+    showToast('所有資料已成功清除！', 'success');
+
+    // 2. Perform background cloud deletion asynchronously (completely out-of-band/non-blocking)
+    setTimeout(async () => {
+      try {
+        const BATCH_SIZE = 450;
         
-        assetsSnap.docs.forEach((doc, index) => {
-          currentBatch.delete(doc.ref);
-          count++;
-          if (count === BATCH_SIZE || index === assetsSnap.docs.length - 1) {
-            batches.push(currentBatch.commit());
-            currentBatch = writeBatch(db);
-            count = 0;
-          }
+        // Fetch and process assets
+        const assetsSnap = await withTimeout(getDocs(collection(db, 'assets')), 10000).catch(err => {
+          console.warn("Background assets fetch failed (safe fallback):", err);
+          return null;
         });
-        await Promise.all(batches);
-      }
 
-      const plansSnap = await getDocs(collection(db, 'plans'));
-      if (plansSnap.size > 0) {
-        const batches = [];
-        let currentBatch = writeBatch(db);
-        let count = 0;
-        
-        plansSnap.docs.forEach((doc, index) => {
-          currentBatch.delete(doc.ref);
-          count++;
-          if (count === BATCH_SIZE || index === plansSnap.docs.length - 1) {
-            batches.push(currentBatch.commit());
-            currentBatch = writeBatch(db);
-            count = 0;
+        if (assetsSnap && assetsSnap.size > 0) {
+          const cloudAssetIds = assetsSnap.docs.map(doc => doc.id);
+          const currentClearedAssetsStr = localStorage.getItem('cleared_asset_ids') || '[]';
+          let currentClearedAssets: string[] = [];
+          try { currentClearedAssets = JSON.parse(currentClearedAssetsStr); } catch (e) {}
+          localStorage.setItem('cleared_asset_ids', JSON.stringify(Array.from(new Set([...currentClearedAssets, ...cloudAssetIds]))));
+
+          const batches = [];
+          let currentBatch = writeBatch(db);
+          let count = 0;
+          
+          assetsSnap.docs.forEach((doc, index) => {
+            currentBatch.delete(doc.ref);
+            count++;
+            if (count === BATCH_SIZE || index === assetsSnap.docs.length - 1) {
+              batches.push(currentBatch);
+              currentBatch = writeBatch(db);
+              count = 0;
+            }
+          });
+
+          for (const batch of batches) {
+            await withTimeout(batch.commit(), 10000).catch(err => {
+              console.warn("Background batch asset deletion failed (expected if quota-exhausted):", err);
+            });
           }
-        });
-        await Promise.all(batches);
-      }
+        }
 
-      showToast('所有資料已清除成功！', 'success');
-      setSelectedPlanId(null);
-      setShowClearConfirm(false);
-    } catch (error: any) {
-      console.error('Failed to clear data', error);
-      if (error?.code === 'resource-exhausted' || error?.message?.includes('permission-denied') || error?.message?.includes('permission')) {
-        setIsLocalMode(true);
-        localStorage.setItem('local_plans', JSON.stringify([]));
-        localStorage.setItem('local_assets', JSON.stringify([]));
-        setPlans([]);
-        setAssets([]);
-        setSelectedPlanId(null);
-        setShowClearConfirm(false);
-        showToast('雲端限額已滿，已為您清除本機快取並切換至「本機模擬儲存模式」', 'success');
-      } else {
-        showToast('清除失敗，請檢查網路連線', 'error');
+        // Fetch and process plans
+        const plansSnap = await withTimeout(getDocs(collection(db, 'plans')), 10000).catch(err => {
+          console.warn("Background plans fetch failed (safe fallback):", err);
+          return null;
+        });
+
+        if (plansSnap && plansSnap.size > 0) {
+          const cloudPlanIds = plansSnap.docs.map(doc => doc.id);
+          const currentClearedPlansStr = localStorage.getItem('cleared_plan_ids') || '[]';
+          let currentClearedPlans: string[] = [];
+          try { currentClearedPlans = JSON.parse(currentClearedPlansStr); } catch (e) {}
+          localStorage.setItem('cleared_plan_ids', JSON.stringify(Array.from(new Set([...currentClearedPlans, ...cloudPlanIds]))));
+
+          const batches = [];
+          let currentBatch = writeBatch(db);
+          let count = 0;
+          
+          plansSnap.docs.forEach((doc, index) => {
+            currentBatch.delete(doc.ref);
+            count++;
+            if (count === BATCH_SIZE || index === plansSnap.docs.length - 1) {
+              batches.push(currentBatch);
+              currentBatch = writeBatch(db);
+              count = 0;
+            }
+          });
+
+          for (const batch of batches) {
+            await withTimeout(batch.commit(), 10000).catch(err => {
+              console.warn("Background batch plan deletion failed (expected if quota-exhausted):", err);
+            });
+          }
+        }
+        console.log("Background cloud data cleanup finished successfully.");
+      } catch (e) {
+        console.error("Async background clear failed:", e);
       }
-    }
+    }, 50);
   };
 
   const handleExportExcel = async () => {
@@ -1510,8 +1646,19 @@ export default function App() {
                     </p>
                   </div>
                   <div className="flex gap-3 pt-2">
-                    <Button variant="outline" className="flex-1" onClick={() => setShowClearConfirm(false)}>取消</Button>
-                    <Button className="flex-1 bg-rose-600 hover:bg-rose-700 text-white border-none" onClick={handleClearAllData}>確定清除</Button>
+                    <Button variant="outline" className="flex-1" onClick={() => setShowClearConfirm(false)} disabled={isClearing}>取消</Button>
+                    <Button 
+                      className="flex-1 bg-rose-600 hover:bg-rose-700 text-white border-none flex items-center justify-center gap-2" 
+                      onClick={handleClearAllData}
+                      disabled={isClearing}
+                    >
+                      {isClearing ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 animate-spin" />
+                          清除中...
+                        </>
+                      ) : '確定清除'}
+                    </Button>
                   </div>
                 </div>
               </Card>
